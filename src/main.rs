@@ -1,13 +1,14 @@
-use anyhow::{anyhow, bail, Error, Result};
+use anyhow::{anyhow, bail, Context, Error, Result};
 use axum::{
     extract::Path,
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get},
     Json, Router,
 };
+use oci_spec::image::{Descriptor};
 use reqwest;
-use serde::{Deserialize, Serialize};
+
 use serde_json::json;
 use std::net::SocketAddr;
 
@@ -40,7 +41,9 @@ struct AppError(anyhow::Error);
 // Tell axum how to convert `AppError` into a response.
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        let inner: serde_json::Value = serde_json::from_str(&self.0.to_string()).unwrap();
+        let inner: serde_json::Value = serde_json::from_str(&self.0.to_string())
+            .with_context(|| format!("deserializing: {}", self.0))
+            .unwrap();
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"message": "internal server error", "inner": inner})),
@@ -77,24 +80,29 @@ async fn fetch_tag_list(name: &str) -> Result<Vec<String>> {
     Ok(tags.tags().to_vec())
 }
 
-async fn fetch_digest(name: &str, reference: &str) -> Result<String> {
+async fn fetch_descriptor(name: &str, reference: &str) -> Result<Descriptor> {
     let client = reqwest::Client::new();
     // query the OCI registry for tags
     let response = client
         .get(format!("{}/v2/{}/manifests/{}", REGISTRY, name, reference))
-        .header("Accept", "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .header(
+            reqwest::header::ACCEPT,
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
         .send()
         .await?;
     if response.status() != StatusCode::OK {
         bail!("{}", response.text().await?);
     }
-    let tags = response.json::<oci_spec::image::ImageManifest>().await?;
-    Ok(tags
-        .layers()
-        .first()
-        .ok_or(anyhow!("no layers"))?
-        .digest()
-        .to_string())
+    let tags = response
+        .json::<oci_spec::image::ImageManifest>()
+        .await
+        .context("reading image manifest")?;
+    Ok(tags.layers().first().ok_or(anyhow!("no layers"))?.clone())
 }
 
 async fn get_blob(
@@ -104,32 +112,43 @@ async fn get_blob(
     let tag = filename.strip_prefix(&format!("{}-", name)).ok_or(anyhow!(
         json!({"message": format!("failed to strip prefix {}- from {}", name, filename)})
     ))?;
-    let tag = tag.strip_suffix(".raw").ok_or(anyhow!(
-        json!({"message": format!("failed to strip suffix .raw from {}", tag)})
-    ))?;
-    let digest = fetch_digest(&name, &tag).await?;
-    let url = format!("{}/v2/{}/blobs/{}", REGISTRY, name, digest);
+    let tag = tag
+        .strip_suffix(EXTENSION_TGZ)
+        .or_else(|| tag.strip_suffix(EXTENSION_RAW))
+        .ok_or(anyhow!(
+            json!({"message": format!("failed to strip suffix from {}", tag)})
+        ))?;
+    let desc = fetch_descriptor(&name, &tag).await?;
+    let url = format!("{}/v2/{}/blobs/{}", REGISTRY, name, desc.digest());
     Ok(axum::response::Redirect::temporary(&url))
 }
+
+const EXTENSION_RAW: &str = ".raw";
+const EXTENSION_TGZ: &str = ".tar.gz";
 
 async fn get_repo(Path(name): Path<String>) -> Result<String, AppError> {
     // query the OCI registry for tags
     let tags = fetch_tag_list(&name).await?;
-    let mut digests: Vec<(String, &str)> = Vec::new();
+    let mut blobs: Vec<(Descriptor, &str)> = Vec::new();
     for tag in tags.iter() {
-        let digest = fetch_digest(&name, &tag).await?;
-        digests.push((digest, tag));
+        let digest = fetch_descriptor(&name, &tag).await?;
+        blobs.push((digest, tag));
     }
     println!("{:?}", tags);
     let mut response = String::new();
-    const EXTENSION: &str = "raw";
-    for digest in digests.iter() {
-        let checksum = digest.0.strip_prefix("sha256:").ok_or(anyhow!(
-            json!({"message": format!("invalid digest: {}", digest.0)})
+    for blob in blobs.iter() {
+        let desc = &blob.0;
+        let digest = desc.digest();
+        let checksum = digest.strip_prefix("sha256:").ok_or(anyhow!(
+            json!({"message": format!("invalid digest: {}", digest)})
         ))?;
+        let extension = match desc.media_type().to_string().as_str() {
+            "application/vnd.docker.image.rootfs.diff.tar.gzip" => EXTENSION_TGZ,
+            _ => EXTENSION_RAW,
+        };
         response.push_str(&format!(
-            "{}  {}-{}.{}\n",
-            checksum, name, digest.1, EXTENSION
+            "{}  {}-{}{}\n",
+            checksum, name, &blob.1, extension
         ));
     }
 
